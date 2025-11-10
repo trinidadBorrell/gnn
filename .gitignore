@@ -2,5 +2,6 @@
 /.venv
 .DS_Store
 *__pycache__*
-/results
+/output
 /explore
+.vscode/

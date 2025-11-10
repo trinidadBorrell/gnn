@@ -8,13 +8,13 @@ class GAE(torch.nn.Module):
         super().__init__()
 
         # Encoder layers
-        self.encoder_conv1 = SAGEConv(in_channels, hidden_channels, aggr='add')
-        self.encoder_conv2 = SAGEConv(hidden_channels, latent_dim, aggr='add')
-
+        self.encoder_conv1 = SAGEConv(in_channels, hidden_channels, aggr='add', project = True)
+        self.encoder_conv2 = SAGEConv(hidden_channels, latent_dim, aggr='add', project = True)
+        
         # Decoder layers
-        self.decoder_conv1 = SAGEConv(latent_dim, hidden_channels, aggr='add')
-        self.decoder_conv2 = SAGEConv(hidden_channels, in_channels, aggr='add')
-       
+        self.decoder_conv1 = SAGEConv(latent_dim, hidden_channels, aggr='add',project = True)
+        self.decoder_conv2 = SAGEConv(hidden_channels, in_channels, aggr='add', project = True)
+
     def encode(self, x, edge_index):
         x = self.encoder_conv1(x, edge_index)
         x = F.relu(x)

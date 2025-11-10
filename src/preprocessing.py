@@ -1,3 +1,4 @@
+import torch
 from torch_geometric.data import Data
 from torch_geometric.utils import dense_to_sparse
 import mne
@@ -8,6 +9,30 @@ import scipy.sparse as sp
 import matplotlib.pyplot as plt
 import os
 import pandas as pd
+
+# Plotting style parameters
+COLOR = "black"
+plt.rcParams.update(
+    {
+        "figure.dpi": 120,
+        "figure.figsize": (14, 9),
+        "font.family": "serif",
+        "mathtext.fontset": "cm",
+        "legend.fontsize": "medium",
+        "legend.title_fontsize": 18,
+        "axes.titlesize": 18,
+        "axes.labelsize": "large",
+        "ytick.labelsize": 12,
+        "xtick.labelsize": 12,
+        # colour-consistent theme
+        "text.color": COLOR,
+        "axes.labelcolor": COLOR,
+        "xtick.color": COLOR,
+        "ytick.color": COLOR,
+        "grid.color": COLOR,
+    }
+)
+plt.rcParams["text.latex.preamble"] = r"\usepackage[version=3]{mhchem}"
 
 
 class EEGtoGraph:
@@ -27,8 +52,11 @@ class EEGtoGraph:
     
     @staticmethod
     def create_torch_geometric_data(f, a):
-        edge_index, _ = dense_to_sparse(a)
-        data = Data(x = f, edge_index = edge_index)
+        a_coo = a.tocoo()
+        edge_array = np.array([a_coo.row, a_coo.col])
+        edge_index = torch.tensor(edge_array, dtype=torch.long)
+        x = torch.tensor(f, dtype=torch.float32)
+        data = Data(x=x, edge_index=edge_index)
         return data
 
     @staticmethod
@@ -325,7 +353,7 @@ class EEGtoGraph:
         window_points: int = 154,
         epoch: int = 0,
         k: int = 6,
-        output_dir: str = './output',
+        output_dir: str = '../output/preprocessing',
         corr_type: str = 'pearson',
         save: bool = True,
         plot_neighbors: bool = False
@@ -393,7 +421,7 @@ class EEGtoGraph:
         
         # Create feature matrix
         print("\nCreating feature matrix...")
-        feature_mat = EEGtoGraph.feature_matrix(main_path, subject_id, session_num, output_dir, save)
+        feature_mat = EEGtoGraph.feature_matrix(main_path, subject_id, session_num, output_dir, save = save)
         print(f"Feature matrix shape: {feature_mat.shape}")
         
         # Plot feature matrix
@@ -475,7 +503,7 @@ def main():
     parser.add_argument(
         '--output_dir',
         type=str,
-        default='./results',
+        default='../output/preprocessing',
         help='Directory to save output plots'
     )
     parser.add_argument(

@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from preprocessing import EEGtoGraph
 from train import TrainGAE
+from inference import InferenceGAE
 
 
 class VGAEPipeline:
@@ -144,6 +145,34 @@ class VGAEPipeline:
         
         return final_model, latent_repr
     
+    def step3_inference(self, model_path):
+        """Step 3: Run inference with a trained model"""
+        print("\n" + "="*70)
+        print("STEP 3: INFERENCE")
+        print("="*70)
+        
+        if self.data is None:
+            raise ValueError("Must load data first!")
+        
+        print(f"\nLoading model from: {model_path}")
+        
+        # Initialize inference
+        inference_engine = InferenceGAE(model_path, self.data)
+        
+        # Run inference
+        x_reconstructed, latent = inference_engine.run_inference()
+        
+        # Create visualization
+        print("\nGenerating visualization...")
+        inference_engine.visualize_results(
+            output_dir=self.config.get('inference_output_dir', '../output/inference'),
+            experiment_name=self.config.get('experiment_name', None)
+        )
+        
+        print("\n✓ Inference completed successfully!")
+        
+        return x_reconstructed, latent
+    
     def run_full_pipeline(self):
         """Run the complete pipeline"""
         print("\n" + "="*70)
@@ -168,6 +197,30 @@ class VGAEPipeline:
         print(f"  - Training: {self.config['training_output_dir']}")
         
         return model, latent, self.data
+    
+    def run_inference_pipeline(self, model_path):
+        """Run inference pipeline on new data"""
+        print("\n" + "="*70)
+        print("VGAE INFERENCE PIPELINE")
+        print("="*70)
+        print(f"\nSubject: {self.config['subject_id']}")
+        print(f"Session: {self.config['session_num']}")
+        print(f"Model: {model_path}")
+        
+        # Step 1: Preprocessing (load test data)
+        self.step1_preprocessing()
+        
+        # Step 3: Inference
+        x_reconstructed, latent = self.step3_inference(model_path)
+        
+        print("\n" + "="*70)
+        print("INFERENCE PIPELINE COMPLETED SUCCESSFULLY!")
+        print("="*70)
+        print("\nOutputs saved to:")
+        print(f"  - Preprocessing: {self.config['preprocessing_output_dir']}")
+        print(f"  - Inference: {self.config.get('inference_output_dir', '../output/inference')}")
+        
+        return x_reconstructed, latent, self.data
 
 
 def create_default_config():
@@ -189,7 +242,7 @@ def create_default_config():
         'corr_type': 'pearson',
         'plot_neighbors': False,
         'save_preprocessing': True,
-        'preprocessing_output_dir': './output/preprocessing',
+        'preprocessing_output_dir': '../output/preprocessing',
         
         # Training parameters
         'hidden_channels': 64,
@@ -199,7 +252,7 @@ def create_default_config():
         'training_mode': 'full',  # 'cv' or 'full'
         'n_splits': 5,  # for cross-validation
         'save_model': True,
-        'training_output_dir': './output/training',
+        'training_output_dir': '../output/training',
         
         # Experiment info
         'experiment_name': None  # defaults to timestamp
@@ -216,12 +269,14 @@ def main():
     # Required arguments
     parser.add_argument('--main_path', type=str, required=True,
                         help='Path to the main EEG data directory')
-    parser.add_argument('--subject_id', type=str, required=True,
-                        help='Subject ID (e.g., "01")')
-    parser.add_argument('--session_num', type=str, required=True,
-                        help='Session number (e.g., "01")')
     parser.add_argument('--coordinates_file', type=str, required=True,
                         help='Path to biosemi64.txt file with electrode labels')
+    
+    # Subject/session arguments (optional with defaults for inference)
+    parser.add_argument('--subject_id', type=str, default='AA069',
+                        help='Subject ID (default: AA069 for inference)')
+    parser.add_argument('--session_num', type=str, default='01',
+                        help='Session number (default: 01)')
     
     # Optional preprocessing arguments
     parser.add_argument('--task', type=str, default='lg',
@@ -232,7 +287,7 @@ def main():
                         help='Epoch number to process')
     parser.add_argument('--k_neighbors', type=int, default=6,
                         help='Number of nearest neighbors for adjacency matrix')
-    parser.add_argument('--preprocessing_output_dir', type=str, default='./output/preprocessing',
+    parser.add_argument('--preprocessing_output_dir', type=str, default='../output/preprocessing',
                         help='Directory to save preprocessing outputs')
     
     # Optional training arguments
@@ -240,7 +295,7 @@ def main():
                         help='Number of hidden channels')
     parser.add_argument('--latent_dim', type=int, default=1,
                         help='Latent dimension size')
-    parser.add_argument('--n_epochs', type=int, default=100,
+    parser.add_argument('--n_epochs', type=int, default=2000,
                         help='Number of training epochs')
     parser.add_argument('--learning_rate', type=float, default=0.01,
                         help='Learning rate')
@@ -248,8 +303,18 @@ def main():
                         help='Training mode: "cv" for cross-validation, "full" for full dataset')
     parser.add_argument('--n_splits', type=int, default=5,
                         help='Number of cross-validation folds')
-    parser.add_argument('--training_output_dir', type=str, default='./output/training',
+    parser.add_argument('--training_output_dir', type=str, default='../output/training',
                         help='Directory to save training outputs')
+    
+    # Mode selection
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference'],
+                        help='Pipeline mode: "train" to train a new model, "inference" to run inference')
+    
+    # Inference-specific arguments
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='Path to trained model for inference (required if mode=inference)')
+    parser.add_argument('--inference_output_dir', type=str, default='../output/inference',
+                        help='Directory to save inference outputs')
     
     # Experiment info
     parser.add_argument('--experiment_name', type=str, default=None,
@@ -258,6 +323,10 @@ def main():
                         help='Plot k-nearest neighbors visualization')
     
     args = parser.parse_args()
+    
+    # Validate inference mode requirements
+    if args.mode == 'inference' and args.model_path is None:
+        parser.error("--model_path is required when mode=inference")
     
     # Create config from arguments
     config = vars(args)
@@ -270,7 +339,13 @@ def main():
     print("="*70)
     
     pipeline = VGAEPipeline(config)
-    model, latent, data = pipeline.run_full_pipeline()
+    
+    if args.mode == 'train':
+        # Training mode
+        model, latent, data = pipeline.run_full_pipeline()
+    else:
+        # Inference mode
+        x_reconstructed, latent, data = pipeline.run_inference_pipeline(args.model_path)
     
     return 0
 
