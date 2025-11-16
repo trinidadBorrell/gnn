@@ -1,3 +1,20 @@
+"""
+MODEL ARCHITECTURE
+==================
+Purpose: Define PyTorch Geometric GNN model architecture.
+
+Pipeline Position: Used by train.py and inference.py
+- Input: None (defines structure only)
+- Output: Model class definition
+
+Key Operations:
+1. Define graph neural network layers (SAGEConv)
+2. Model initialization methods
+3. Forward pass logic
+
+This file only defines the model structure, doesn't handle data or training.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

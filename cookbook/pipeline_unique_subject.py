@@ -21,7 +21,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from preprocessing import EEGtoGraph
-from train import TrainGAE
+from train_unique_graph import TrainGAE
 from inference import InferenceGAE
 
 

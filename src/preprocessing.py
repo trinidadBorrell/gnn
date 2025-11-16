@@ -1,6 +1,23 @@
+"""
+PREPROCESSING PIPELINE
+======================
+Purpose: Transform raw .fif files into PyTorch Geometric Data objects and create dataloaders.
+
+Pipeline Position: FIRST STEP
+- Input: Raw .fif files (EEG/MEG recordings)
+- Output: train_loader, val_loader, test_loader
+
+Key Operations:
+1. Load .fif files and convert to PyTorch Geometric Data objects
+2. Split data into train/test/val before any model sees it (70%/15%/15%)
+3. Create DataLoader objects for each split
+4. Apply any necessary normalization/preprocessing
+"""
+
 import torch
 from torch_geometric.data import Data
-from torch_geometric.utils import dense_to_sparse
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
 import mne
 import numpy as np
 import argparse
@@ -34,9 +51,18 @@ plt.rcParams.update(
 )
 plt.rcParams["text.latex.preamble"] = r"\usepackage[version=3]{mhchem}"
 
+class GraphAutoencoderDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        sample = self.data[index]
+        return sample, sample
 
 class EEGtoGraph:
-
     # Read results single subject
     @staticmethod
     def load_epochs(main_path: str, subject_id: str, session_num: str, task: str = 'lg'):
@@ -178,7 +204,7 @@ class EEGtoGraph:
         
         if save and output_dir:
             num_electrodes = len(coords_df)
-            output_path = os.path.join(output_dir, 'images', f'k_nearest_neighbours_k{k}_{num_electrodes}_electrodes.png')
+            output_path = os.path.join('/Users/trinidad.borrell/Documents/Work/PhD/Proyects/VGAE/gnn/output/preprocessing/data', 'images', f'k_nearest_neighbours_k{k}_{num_electrodes}_electrodes.png')
             plt.savefig(output_path, dpi=300, bbox_inches='tight')
             print(f"Saved k-nearest neighbors plot to: {output_path}")
             plt.close()
@@ -289,7 +315,10 @@ class EEGtoGraph:
 
         print(f'Shape of feature matrix: {F.shape}')
         if save:
-            np.save(f'{output_dir}/data/feature_matrix_sub{subject_id}_session_{session_num}.npy', F)
+            np.save(f'{output_dir}/data/feature_matrix/feature_matrix_sub{subject_id}_session_{session_num}.npy', F)
+            #check if you can load it
+            loaded_F = np.load(f'{output_dir}/data/feature_matrix/feature_matrix_sub{subject_id}_session_{session_num}.npy')
+            print(f'Shape of loaded feature matrix: {loaded_F.shape}')
         return F
     
 
@@ -302,7 +331,8 @@ class EEGtoGraph:
         filename: str,
         cmap: str = 'viridis',
         figsize: tuple = (10, 8),
-        labels_: list = []
+        labels_: list = [],
+        matrix_type: str = 'feature'
     ):
         """
         Plot a matrix and save it to a file.
@@ -326,9 +356,15 @@ class EEGtoGraph:
         im = ax.imshow(matrix_dense, cmap=cmap, aspect='auto')
         ax.set_title(title, fontsize=14, fontweight='bold')
         ax.set_xlabel('Node Index', fontsize=12)
-        ax.set_ylabel('Node Index', fontsize=12)
+        if matrix_type == 'adjacency':
+            ax.set_ylabel('Node Index', fontsize=12)
+            ax.set_xticks(range(len(labels_)), labels=labels_, rotation=45, fontsize=6)
+
+        else:
+            ax.set_ylabel('Feature Index', fontsize=12)
+            ax.set_xticks(range(int(matrix_dense.shape[1])), labels=np.linspace(-0.2, 1.34, int(matrix_dense.shape[1])), fontsize=6)
+
         ax.set_yticks(range(len(labels_)), labels=labels_, rotation=45, fontsize=6)
-        ax.set_xticks(range(len(labels_)), labels=labels_, rotation=45, fontsize=6)
         
         # Add colorbar
         cbar = plt.colorbar(im, ax=ax)
@@ -352,7 +388,7 @@ class EEGtoGraph:
         task: str = 'lg',
         window_points: int = 154,
         epoch: int = 0,
-        k: int = 6,
+        k: int = 6, 
         output_dir: str = '../output/preprocessing',
         corr_type: str = 'pearson',
         save: bool = True,
@@ -415,7 +451,8 @@ class EEGtoGraph:
                 output_dir,
                 f'adjacency_matrix_{num_electrodes}.png',
                 cmap='binary',
-                labels_=labels
+                labels_=labels, 
+                matrix_type='adjacency'
             )
         
         
@@ -441,6 +478,43 @@ class EEGtoGraph:
         print("\nGraph creation completed successfully!")
         
         return data, adjacency, feature_mat, labels, distance_matrix
+    
+    @staticmethod
+    def create_graph_dataset(main_path, coords_df, task = 'lg', window_points = 64, k = 6, output_dir = 'output/preprocessing', corr_type = 'pearson', save = True, plot_neighbors = False):
+        
+        dataset = []
+
+        for subject_id in os.listdir(main_path):
+            for session_num in os.listdir(os.path.join(main_path, subject_id)):
+                if session_num.split('-')[0] != 'ses':
+                    continue
+                for epoch in os.listdir(os.path.join(main_path, subject_id, session_num)):
+                    if epoch != 'eeg':
+                        continue
+                    data, adjacency, feature_mat, labels, distance_matrix = EEGtoGraph.create_graph(
+                        coords_df=coords_df,
+                        main_path=main_path,
+                        subject_id=subject_id.split('-')[1],
+                        session_num=session_num.split('-')[1],
+                        task=task,
+                        window_points=window_points,
+                        epoch=epoch,
+                        k=k,
+                        output_dir=output_dir,
+                        corr_type=corr_type,
+                        save=save,
+                        plot_neighbors=plot_neighbors
+                    )
+                    dataset.append(data)
+        
+        dataset_train, dataset_val = train_test_split(dataset, test_size=0.3, random_state=42)
+        dataset_test = train_test_split(dataset_val, test_size=0.5, random_state=42)
+        
+        dataset_train = GraphAutoencoderDataset(dataset_train)
+        dataset_val = GraphAutoencoderDataset(dataset_val)
+        dataset_test = GraphAutoencoderDataset(dataset_test)
+
+        return dataset_train, dataset_val, dataset_test
 
 
 def main():
@@ -456,18 +530,7 @@ def main():
         required=True,
         help='Path to the main data directory'
     )
-    parser.add_argument(
-        '--subject_id',
-        type=str,
-        required=True,
-        help='Subject ID (e.g., "01")'
-    )
-    parser.add_argument(
-        '--session_num',
-        type=str,
-        required=True,
-        help='Session number (e.g., "01")'
-    )
+
     parser.add_argument(
         '--coordinates_file',
         type=str,
@@ -476,6 +539,23 @@ def main():
     )
     
     # Optional arguments
+    parser.add_argument(
+        '--one_subject',
+        type=bool,
+        default=False,
+        help='Process only one subject'
+    )
+    parser.add_argument(
+        '--subject_id',
+        type=str,
+        help='Subject ID (e.g., "01")'
+    )
+    parser.add_argument(
+        '--session_num',
+        type=str,
+        help='Session number (e.g., "01")'
+    )
+
     parser.add_argument(
         '--task',
         type=str,
@@ -527,7 +607,7 @@ def main():
     
     args = parser.parse_args()
     
-    # Load coordinates
+    # Load coordinatesarg
     try:
         from eeg_positions import get_elec_coords
         
@@ -548,9 +628,9 @@ def main():
         traceback.print_exc()
         return 1
     
-    # Run the graph creation
-    try:
-        data, adjacency, features, labels, distance_matrix = EEGtoGraph.create_graph(
+    
+    if args.one_subject:
+        data, adjacency, feature_mat, labels, distance_matrix = EEGtoGraph.create_graph(
             coords_df=coords_df,
             main_path=args.main_path,
             subject_id=args.subject_id,
@@ -568,14 +648,27 @@ def main():
         print("\n" + "="*60)
         print("SUCCESS: All operations completed!")
         print("="*60)
+
+        return data, adjacency, feature_mat, labels, distance_matrix
+
+    else:
+        data_train, data_val, data_test = EEGtoGraph.create_graph_dataset(
+            coords_df=coords_df,
+            main_path=args.main_path,
+            task=args.task,
+            window_points=args.window_points,
+            k=args.k,
+            output_dir=args.output_dir,
+            corr_type=args.corr_type,
+            save=args.save,
+            plot_neighbors=args.plot_neighbors
+        )
         
-    except Exception as e:
-        print(f"\nERROR: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return 1
-    
-    return 0
+        print("\n" + "="*60)
+        print("SUCCESS: All operations completed!")
+        print("="*60)
+        
+        return data_train, data_val, data_test
 
 
 if __name__ == '__main__':

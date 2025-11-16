@@ -1,3 +1,21 @@
+"""
+INFERENCE & EVALUATION PIPELINE
+================================
+Purpose: Final model evaluation and predictions on unseen data.
+
+Pipeline Position: FINAL STEP
+- Input: Trained model, test_loader (or new data)
+- Output: Performance metrics, predictions
+
+Key Operations:
+1. evaluate_model(): Run model on test_loader ONCE for final metrics
+2. predict(): Make predictions on new unseen data
+3. visualize_results(): Generate plots and analysis
+
+Critical: This is the ONLY place where test_loader is used. 
+Test set provides unbiased estimate of real-world performance.
+"""
+
 import argparse
 import torch
 import torch.nn.functional as F
