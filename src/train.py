@@ -26,8 +26,8 @@ import matplotlib.pyplot as plt
 import os
 from datetime import datetime
 from model import GAE
-from torch.utils.data import DataLoader
-import ray.tune as tune
+import ray
+from ray import tune
 from ray.tune.schedulers import ASHAScheduler
 
 # Plotting style parameters
@@ -54,86 +54,93 @@ plt.rcParams.update(
 plt.rcParams["text.latex.preamble"] = r"\usepackage[version=3]{mhchem}"
 
 
-class TrainGAE:
-    def __init__(self, data, config):
-        self.data = data
-        self.data_raw = data.x.clone()  # Store original raw data
-        
-        # Normalize input data to [-1, 1]
-        self.x_min = data.x.min()
-        self.x_max = data.x.max()
-        self.x_range = self.x_max - self.x_min
-        
-        if self.x_range > 0:
-            # Normalize to [0, 1] then to [-1, 1]
-            self.data.x = 2 * (data.x - self.x_min) / self.x_range - 1
+def normalize_graph_features(graph_list):
+    """Normalize all graphs in a list to [-1, 1] range."""
+    all_features = torch.cat([g.x for g in graph_list], dim=0)
+    x_min = all_features.min()
+    x_max = all_features.max()
+    x_range = x_max - x_min
+    
+    normalized_graphs = []
+    for g in graph_list:
+        g_copy = g.clone()
+        if x_range > 0:
+            g_copy.x = 2 * (g.x - x_min) / x_range - 1
         else:
-            # If all values are the same, set to 0
-            self.data.x = torch.zeros_like(data.x)
-        
-        self.in_channels = config['in_channels']
-        self.hidden_channels = config['hidden_channels']
-        self.latent_dimension = config['latent_dimension']
-        self.n_epochs = config['n_epochs']
-        self.batch_size = config['batch_size']
-        self.dropout_rate = config['dropout_rate']
-        self.lr = config['lr']
-        self.tuning = config['tuning']
-        
-    def denormalize(self, x_normalized):
-        """Convert from [-1, 1] back to original scale"""
-        if self.x_range > 0:
-            return (x_normalized + 1) / 2 * self.x_range + self.x_min
-        else:
-            return x_normalized + self.x_min
+            g_copy.x = torch.zeros_like(g.x)
+        normalized_graphs.append(g_copy)
+    
+    return normalized_graphs, x_min, x_max, x_range
 
-    def train_model(self, train_dataset, test_dataset):
-        # Create data loader
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
-        
-        # Initialize model
-        model = GAE(input_size=20, hidden_channels = self.hidden_channels, latent_dim = self.latent_dimension, dropout_rate=self.dropout_rate)
-        criterion = torch.nn.MSELoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
-        
-        # Training loop
-        model.train()
-        
-        total_loss = 0
-        avg_loss = 0
 
-        for epoch in range(self.n_epochs):
-            for batch_x, batch_y in train_loader:
-                optimizer.zero_grad()
-                outputs = model(batch_x)
-                loss = criterion(outputs, batch_y)
-                loss.backward()
-                optimizer.step()
-            
+def compute_mse_on_graphs(model, graph_list):
+    """Compute average MSE reconstruction loss over a list of graphs."""
+    model.eval()
+    total_loss = 0.0
+    criterion = torch.nn.MSELoss()
+    
+    with torch.no_grad():
+        for graph in graph_list:
+            x_recon, _ = model(graph.x, graph.edge_index)
+            loss = criterion(x_recon, graph.x)
             total_loss += loss.item()
-            avg_loss = total_loss / len(train_loader)
+    
+    return total_loss / len(graph_list) if len(graph_list) > 0 else 0.0
 
-            if self.tuning:
-                tune.report(loss=avg_loss, epoch=epoch)
-            else:
-                print(f"Epoch {epoch}, Loss: {avg_loss}")
+
+def train_one_epoch(model, optimizer, criterion, graph_list):
+    """Train model for one epoch over all graphs."""
+    model.train()
+    total_loss = 0.0
+    
+    for graph in graph_list:
+        optimizer.zero_grad()
+        x_recon, _ = model(graph.x, graph.edge_index)
+        loss = criterion(x_recon, graph.x)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    
+    return total_loss / len(graph_list) if len(graph_list) > 0 else 0.0
+
+
+def ray_trainable(config, train_graphs=None, val_graphs=None):
+    """Ray Tune trainable function. Trains on train_graphs, reports val MSE."""
+    from ray.air import session
+    
+    in_channels = config['in_channels']
+    hidden_channels = config['hidden_channels']
+    latent_dim = config['latent_dim']
+    lr = config['lr']
+    n_epochs = config['n_epochs']
+    
+    model = GAE(in_channels, hidden_channels, latent_dim)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    criterion = torch.nn.MSELoss()
+    
+    for epoch in range(n_epochs):
+        train_loss = train_one_epoch(model, optimizer, criterion, train_graphs)
+        val_mse = compute_mse_on_graphs(model, val_graphs)
         
-        if not self.tuning:
-            # Evaluation
-            model.eval()
+        session.report({"val_mse": val_mse, "train_loss": train_loss, "epoch": epoch})
 
-            with torch.no_grad():
-                outputs = model(test_dataset)
-            mse = F.mse_loss(outputs, test_dataset.y).item()
-            
-            return mse
 
-    def save_model_and_visualizations(self, model, loss_history=None, output_dir='../output/training', experiment_name=None):
+class TrainGAE:
+    """Wrapper for final model training after hyperparameter tuning."""
+    
+    def __init__(self, train_graphs, val_graphs, test_graphs, in_channels):
+        self.train_graphs = train_graphs
+        self.val_graphs = val_graphs
+        self.test_graphs = test_graphs
+        self.in_channels = in_channels
+
+    def save_model_and_visualizations(self, model, config, loss_history=None, output_dir='../output/training', experiment_name=None):
         """
         Save the trained model and create 4-column visualization plot plus loss plot
         
         Args:
             model: Trained GAE model
+            config: Configuration dict with hyperparameters
             loss_history: List of loss values across epochs
             output_dir: Directory to save outputs
             experiment_name: Name for this experiment (defaults to timestamp)
@@ -141,97 +148,17 @@ class TrainGAE:
         if experiment_name is None:
             experiment_name = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # Create output directories
         model_dir = os.path.join(output_dir, 'models')
         plots_dir = os.path.join(output_dir, 'plots')
         os.makedirs(model_dir, exist_ok=True)
         os.makedirs(plots_dir, exist_ok=True)
         
-        # Save model
         model_path = os.path.join(model_dir, f'gae_model_{experiment_name}.pt')
         torch.save({
             'model_state_dict': model.state_dict(),
-            'in_channels': self.in_channels,
-            'hidden_channels': self.hidden_channels,
-            'latent_dim': self.latent_dim,
-            'n_epochs': self.n_epochs,
-            'lr': self.lr
+            'config': config
         }, model_path)
         print(f"\nModel saved to: {model_path}")
-        
-        # Generate predictions
-        model.eval()
-        with torch.no_grad():
-            x_reconstructed, z = model(self.data.x, self.data.edge_index)
-            
-            # Calculate reconstruction error in normalized space
-            error_normalized = torch.abs(self.data.x - x_reconstructed)
-            
-            # Denormalize for visualization in original scale
-            original_denorm = self.denormalize(self.data.x)
-            reconstruction_denorm = self.denormalize(x_reconstructed)
-            error_denorm = torch.abs(original_denorm - reconstruction_denorm)
-            
-            # Convert to numpy for plotting (use normalized values)
-            original = self.data.x.cpu().numpy()
-            reconstruction = x_reconstructed.cpu().numpy()
-            error_np = error_normalized.cpu().numpy()
-            latent = z.cpu().numpy()
-        
-        # Create 4-column visualization
-        fig, axes = plt.subplots(1, 4, figsize=(24, 6))
-        
-        # Plot 1: Original Feature Matrix (normalized)
-        im1 = axes[0].imshow(original, aspect='auto', cmap='viridis', vmin=-1, vmax=1)
-        axes[0].set_title('Original Feature Matrix\n(Normalized [-1, 1])', fontsize=14, fontweight='bold')
-        axes[0].set_xlabel('Features')
-        axes[0].set_ylabel('Nodes')
-        plt.colorbar(im1, ax=axes[0])
-        
-        # Plot 2: Reconstructed Feature Matrix (normalized)
-        im2 = axes[1].imshow(reconstruction, aspect='auto', cmap='viridis', vmin=-1, vmax=1)
-        axes[1].set_title('Reconstruction\n(Normalized [-1, 1])', fontsize=14, fontweight='bold')
-        axes[1].set_xlabel('Features')
-        axes[1].set_ylabel('Nodes')
-        plt.colorbar(im2, ax=axes[1])
-        
-        # Plot 3: Reconstruction Error (in normalized space)
-        im3 = axes[2].imshow(error_np, aspect='auto', cmap='Reds')
-        axes[2].set_title('Reconstruction Error\n(Normalized Space)', fontsize=14, fontweight='bold')
-        axes[2].set_xlabel('Features')
-        axes[2].set_ylabel('Nodes')
-        plt.colorbar(im3, ax=axes[2])
-        
-        # Plot 4: Latent Space Representation
-        if self.latent_dim == 1:
-            # For 1D latent space, plot as a heatmap
-            im4 = axes[3].imshow(latent, aspect='auto', cmap='coolwarm')
-            axes[3].set_title('Latent Space (1D)', fontsize=14, fontweight='bold')
-            axes[3].set_xlabel('Latent Dimension')
-            axes[3].set_ylabel('Nodes')
-            plt.colorbar(im4, ax=axes[3])
-        elif self.latent_dim == 2:
-            # For 2D latent space, scatter plot
-            axes[3].scatter(latent[:, 0], latent[:, 1], alpha=0.6, c=range(len(latent)), cmap='coolwarm')
-            axes[3].set_title('Latent Space (2D)', fontsize=14, fontweight='bold')
-            axes[3].set_xlabel('Latent Dim 1')
-            axes[3].set_ylabel('Latent Dim 2')
-            axes[3].grid(True, alpha=0.3)
-        else:
-            # For higher dimensions, show as heatmap
-            im4 = axes[3].imshow(latent, aspect='auto', cmap='coolwarm')
-            axes[3].set_title(f'Latent Space ({self.latent_dim}D)', fontsize=14, fontweight='bold')
-            axes[3].set_xlabel('Latent Dimensions')
-            axes[3].set_ylabel('Nodes')
-            plt.colorbar(im4, ax=axes[3])
-        
-        plt.tight_layout()
-        
-        # Save plot
-        plot_path = os.path.join(plots_dir, f'gae_visualization_{experiment_name}.png')
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        print(f"Visualization saved to: {plot_path}")
-        plt.close()
         
         # Plot loss history if available
         if loss_history is not None:
@@ -248,222 +175,258 @@ class TrainGAE:
             print(f"Loss history plot saved to: {loss_plot_path}")
             plt.close()
         
-        # Calculate and print metrics (in normalized space)
-        mse = F.mse_loss(x_reconstructed, self.data.x).item()
-        mae = torch.mean(error_normalized).item()
+        # Create GAE visualization with 5 random validation graphs
+        self._create_gae_visualization(model, config, plots_dir, experiment_name)
         
-        # Also calculate metrics in original scale
-        mse_denorm = F.mse_loss(reconstruction_denorm, original_denorm).item()
-        mae_denorm = torch.mean(error_denorm).item()
+        return model_path
+    
+    def _create_gae_visualization(self, model, config, plots_dir, experiment_name):
+        """Create 5x4 grid visualization of GAE reconstructions from validation set."""
+        import numpy as np
         
-        print("\n" + "="*60)
-        print("Reconstruction Metrics")
-        print("="*60)
-        print("Normalized space [-1, 1]:")
-        print(f"  MSE: {mse:.6f}")
-        print(f"  MAE: {mae:.6f}")
-        print("\nOriginal scale:")
-        print(f"  MSE: {mse_denorm:.10f}")
-        print(f"  MAE: {mae_denorm:.10f}")
-        print("="*60 + "\n")
+        # Select 5 random validation graphs
+        num_samples = min(5, len(self.val_graphs))
+        indices = np.random.choice(len(self.val_graphs), num_samples, replace=False)
+        sample_graphs = [self.val_graphs[i] for i in indices]
         
-        return model_path, plot_path
+        model.eval()
+        
+        # Create figure with 5 rows, 4 columns
+        fig, axes = plt.subplots(num_samples, 4, figsize=(20, 5 * num_samples))
+        if num_samples == 1:
+            axes = axes.reshape(1, -1)
+        
+        latent_dim = config['latent_dim']
+        
+        with torch.no_grad():
+            for row_idx, graph in enumerate(sample_graphs):
+                # Forward pass
+                x_recon, z = model(graph.x, graph.edge_index)
+                
+                # Calculate error in normalized space
+                error_normalized = torch.abs(graph.x - x_recon)
+                
+                # Convert to numpy
+                original = graph.x.cpu().numpy()
+                reconstruction = x_recon.cpu().numpy()
+                error_np = error_normalized.cpu().numpy()
+                latent = z.cpu().numpy()
+                
+                # Column 1: Original Feature Matrix (normalized [-1, 1])
+                im1 = axes[row_idx, 0].imshow(original, aspect='auto', cmap='viridis', vmin=-1, vmax=1)
+                axes[row_idx, 0].set_title(f'Graph {indices[row_idx]} - Original\n(Normalized [-1, 1])', fontsize=12, fontweight='bold')
+                axes[row_idx, 0].set_xlabel('Features')
+                axes[row_idx, 0].set_ylabel('Nodes')
+                plt.colorbar(im1, ax=axes[row_idx, 0])
+                
+                # Column 2: Reconstructed Feature Matrix (normalized [-1, 1])
+                im2 = axes[row_idx, 1].imshow(reconstruction, aspect='auto', cmap='viridis', vmin=-1, vmax=1)
+                axes[row_idx, 1].set_title(f'Reconstruction\n(Normalized [-1, 1])', fontsize=12, fontweight='bold')
+                axes[row_idx, 1].set_xlabel('Features')
+                axes[row_idx, 1].set_ylabel('Nodes')
+                plt.colorbar(im2, ax=axes[row_idx, 1])
+                
+                # Column 3: Reconstruction Error
+                im3 = axes[row_idx, 2].imshow(error_np, aspect='auto', cmap='Reds')
+                axes[row_idx, 2].set_title(f'Reconstruction Error\n(MAE: {error_np.mean():.6f})', fontsize=12, fontweight='bold')
+                axes[row_idx, 2].set_xlabel('Features')
+                axes[row_idx, 2].set_ylabel('Nodes')
+                plt.colorbar(im3, ax=axes[row_idx, 2])
+                
+                # Column 4: Latent Space Representation
+                if latent_dim == 1:
+                    # For 1D latent space, plot as a heatmap
+                    im4 = axes[row_idx, 3].imshow(latent, aspect='auto', cmap='coolwarm')
+                    axes[row_idx, 3].set_title('Latent Space (1D)', fontsize=12, fontweight='bold')
+                    axes[row_idx, 3].set_xlabel('Latent Dimension')
+                    axes[row_idx, 3].set_ylabel('Nodes')
+                    plt.colorbar(im4, ax=axes[row_idx, 3])
+                elif latent_dim == 2:
+                    # For 2D latent space, scatter plot
+                    scatter = axes[row_idx, 3].scatter(latent[:, 0], latent[:, 1], alpha=0.6, 
+                                                       c=range(len(latent)), cmap='coolwarm')
+                    axes[row_idx, 3].set_title('Latent Space (2D)', fontsize=12, fontweight='bold')
+                    axes[row_idx, 3].set_xlabel('Latent Dim 1')
+                    axes[row_idx, 3].set_ylabel('Latent Dim 2')
+                    axes[row_idx, 3].grid(True, alpha=0.3)
+                    plt.colorbar(scatter, ax=axes[row_idx, 3])
+                else:
+                    # For higher dimensions, show as heatmap
+                    im4 = axes[row_idx, 3].imshow(latent, aspect='auto', cmap='coolwarm')
+                    axes[row_idx, 3].set_title(f'Latent Space ({latent_dim}D)', fontsize=12, fontweight='bold')
+                    axes[row_idx, 3].set_xlabel('Latent Dimensions')
+                    axes[row_idx, 3].set_ylabel('Nodes')
+                    plt.colorbar(im4, ax=axes[row_idx, 3])
+        
+        plt.tight_layout()
+        
+        # Save plot
+        viz_path = os.path.join(plots_dir, f'gae_visualization_{experiment_name}.png')
+        plt.savefig(viz_path, dpi=300, bbox_inches='tight')
+        print(f"GAE visualization saved to: {viz_path}")
+        plt.close()
 
-    def train_full(self, save_results=False, output_dir='../output/training', experiment_name=None):
-        """Train on full dataset (no validation split)"""
+    def train_final(self, config, save_results=False, output_dir='../output/training', experiment_name=None):
+        """Train final model on train+val with best config, evaluate on test."""
         print(f"\n{'='*60}")
-        print("Training on Full Dataset")
+        print("Training Final Model on Train+Val")
         print(f"{'='*60}\n")
         
-        # Print initial data statistics
-        print("Original (raw) data statistics:")
-        print(f"  Shape: {self.data_raw.shape}")
-        print(f"  Range: [{self.data_raw.min():.6f}, {self.data_raw.max():.6f}]")
-        print(f"  Mean: {self.data_raw.mean():.6f}, Std: {self.data_raw.std():.6f}")
+        # Combine train and val for final training
+        combined_graphs = self.train_graphs + self.val_graphs
         
-        print("\nNormalized data statistics (used for training):")
-        print(f"  Shape: {self.data.x.shape}")
-        print(f"  Range: [{self.data.x.min():.6f}, {self.data.x.max():.6f}]")
-        print(f"  Mean: {self.data.x.mean():.6f}, Std: {self.data.x.std():.6f}")
-        print(f"  Non-zero elements: {(self.data.x != 0).sum().item()} / {self.data.x.numel()}")
-        print()
-        
-        # Initialize model
-        model = GAE(
-            self.in_channels,
-            self.hidden_channels,
-            self.latent_dim 
-        )
-
-        # Optimizer
-        optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr)
-
-        # Loss function MSE
+        model = GAE(config['in_channels'], config['hidden_channels'], config['latent_dim'])
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config['lr'])
         criterion = torch.nn.MSELoss()
-
-        # Track loss history
+        
         loss_history = []
         
-        model.train()
-
-        for epoch in range(self.n_epochs):
-            optimizer.zero_grad()
-            
-            # Forward pass
-            x_reconstructed, z = model(self.data.x, self.data.edge_index)
-            
-            # Debug: Check reconstruction quality (in normalized space [-1, 1])
-            if epoch % 100 == 0:
-                diff = x_reconstructed - self.data.x
-                print(f"  Data (normalized)  - Mean: {self.data.x.mean():.6f}, Std: {self.data.x.std():.6f}, Range: [{self.data.x.min():.6f}, {self.data.x.max():.6f}]")
-                print(f"  Recon (normalized) - Mean: {x_reconstructed.mean():.6f}, Std: {x_reconstructed.std():.6f}, Range: [{x_reconstructed.min():.6f}, {x_reconstructed.max():.6f}]")
-                print(f"  Diff (normalized)  - Mean: {diff.mean():.6f}, Std: {diff.std():.6f}, Range: [{diff.min():.6f}, {diff.max():.6f}]")
-            
-               
-            # Reconstruction loss
-            loss = criterion(x_reconstructed, self.data.x) 
-            
-            # Backward pass
-            loss.backward()
-            optimizer.step()
-
-            if epoch > 200:
-                # Store loss
-                loss_history.append(loss.item())
+        for epoch in range(config['n_epochs']):
+            train_loss = train_one_epoch(model, optimizer, criterion, combined_graphs)
+            loss_history.append(train_loss)
             
             if epoch % 100 == 0:
-                print(f'Epoch {epoch:03d}, Loss: {loss.item():.6f}')
-
-        # Evaluation
-        model.eval()
-        with torch.no_grad():
-            x_reconstructed, z = model(self.data.x, self.data.edge_index)
-            
-            print(f"\n{'='*60}")
-            print("Final Results")
-            print(f"{'='*60}")
-            print(f"Original features shape: {self.data.x.shape}")
-            print(f"Latent representation shape: {z.shape}")
-            print(f"Reconstructed features shape: {x_reconstructed.shape}")
-            
-            # Calculate reconstruction error in normalized space
-            reconstruction_error_norm = F.mse_loss(x_reconstructed, self.data.x)
-            print(f"\nFinal reconstruction error (normalized [-1, 1]): {reconstruction_error_norm.item():.6f}")
-            
-            # Calculate reconstruction error in original scale
-            original_denorm = self.denormalize(self.data.x)
-            reconstruction_denorm = self.denormalize(x_reconstructed)
-            reconstruction_error_orig = F.mse_loss(reconstruction_denorm, original_denorm)
-            print(f"Final reconstruction error (original scale): {reconstruction_error_orig.item():.10f}")
-            
-            # Visualize latent space
-            print("\nLatent space values (first 10 nodes):")
-            print(z[:10].squeeze())
-            print(f"{'='*60}\n")
+                print(f'Epoch {epoch:03d}, Loss: {train_loss:.6f}')
         
-        # Save model and visualizations if requested
+        # Final evaluation on test set
+        test_mse = compute_mse_on_graphs(model, self.test_graphs)
+        
+        print(f"\n{'='*60}")
+        print("Final Results")
+        print(f"{'='*60}")
+        print(f"Test MSE: {test_mse:.6f}")
+        print(f"{'='*60}\n")
+        
         if save_results:
-            self.save_model_and_visualizations(model, loss_history, output_dir, experiment_name)
+            self.save_model_and_visualizations(model, config, loss_history, output_dir, experiment_name)
         
-        return model, z
+        return model
 
-def main(data=None):
+def main():
     """
     Main training function
     
-    Args:
-        data: PyTorch Geometric Data object. If None, expects to be run from command line with data available
+    Loads train/val/test datasets, optionally runs Ray Tune, then trains final model.
     """
-    parser = argparse.ArgumentParser(description='Train Graph Autoencoder with Cross-Validation')
+    parser = argparse.ArgumentParser(description='Train Graph Autoencoder with Ray Tune')
 
-    
-    parser.add_argument('--dataset', type=str, required=True,
-                        help='Path to dataset of subject info in geometric torch format')
-    parser.add_argument('--tuning', type=bool, default=False,
-                        help='True if hyperparameter tuning is enabled')
+    parser.add_argument('--train_dataset', type=str, required=True,
+                        help='Path to train_dataset.pt')
+    parser.add_argument('--val_dataset', type=str, required=True,
+                        help='Path to val_dataset.pt')
+    parser.add_argument('--test_dataset', type=str, required=True,
+                        help='Path to test_dataset.pt')
+    parser.add_argument('--tuning', action='store_true',
+                        help='Enable hyperparameter tuning with Ray Tune')
     parser.add_argument('--hidden_channels', type=int, default=64,
                         help='Number of hidden channels (default: 64)')
-    parser.add_argument('--latent_dim', type=int, default=1,
-                        help='Latent dimension size (default: 1)')
-    parser.add_argument('--batch-size', type=int, default=32,
-                        help='Batch size --> Number of matrices')
-    parser.add_argument('--num-workers', type=int, default=4,
-                        help='Number of workers (default: 4)')
-    parser.add_argument('--n_epochs', type=int, default=100,
-                        help='Number of training epochs (default: 100)')
-    parser.add_argument('--lr', type=float, default=0.01,
-                        help='Learning rate (default: 0.01)')
+    parser.add_argument('--latent_dim', type=int, default=2,
+                        help='Latent dimension size (default: 2)')
+    parser.add_argument('--n_epochs', type=int, default=500,
+                        help='Number of training epochs (default: 500)')
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='Learning rate (default: 0.001)')
     parser.add_argument('--save', action='store_true',
                         help='Save model and visualizations')
     parser.add_argument('--output_dir', type=str, default='../output/training',
                         help='Directory to save outputs (default: ../output/training)')
     parser.add_argument('--experiment_name', type=str, default=None,
                         help='Name for this experiment (defaults to timestamp)')
+    parser.add_argument('--num_samples', type=int, default=10,
+                        help='Number of Ray Tune samples (default: 10)')
     
     args = parser.parse_args()
 
-    #0) Load data and define TrainGAE
-
-    data = torch.load(args.dataset)
+    # Load datasets
+    print("\n" + "="*70)
+    print("Loading datasets...")
+    print("="*70)
+    train_dataset = torch.load(args.train_dataset, weights_only=False)
+    val_dataset = torch.load(args.val_dataset, weights_only=False)
+    test_dataset = torch.load(args.test_dataset, weights_only=False)
     
-    trainer = TrainGAE(
-        data=data,
-    )
+    # Extract underlying graph lists from GraphAutoencoderDataset
+    train_graphs = train_dataset.data
+    val_graphs = val_dataset.data
+    test_graphs = test_dataset.data
     
-    #1) Optimize parameters
+    print(f"Train graphs: {len(train_graphs)}")
+    print(f"Val graphs:   {len(val_graphs)}")
+    print(f"Test graphs:  {len(test_graphs)}")
+    
+    # Normalize all graphs
+    all_graphs = train_graphs + val_graphs + test_graphs
+    normalized_all, x_min, x_max, x_range = normalize_graph_features(all_graphs)
+    
+    train_graphs = normalized_all[:len(train_graphs)]
+    val_graphs = normalized_all[len(train_graphs):len(train_graphs)+len(val_graphs)]
+    test_graphs = normalized_all[len(train_graphs)+len(val_graphs):]
+    
+    # Get in_channels from first graph
+    in_channels = train_graphs[0].x.shape[1]
+    print(f"Input channels: {in_channels}")
+    
+    # Hyperparameter optimization with Ray Tune
     if args.tuning:
+        print("\n" + "="*70)
+        print("Running Ray Tune hyperparameter optimization")
+        print("="*70)
+        
+        ray.init(ignore_reinit_error=True)
+        
         search_space = {
-        'in_channels': data.shape[1],
-        'hidden_channels': [64, 128, 256],
-        'batch_size': [32, 64, 128],
-        'latent_dimension': [1, 2, 3, 4, 5],
-        'n_epochs': [100, 500, 1000, 2000],
-        'lr': [0.01, 0.001, 0.0001],
-        'tuning': True
+            'in_channels': in_channels,
+            'hidden_channels': tune.choice([32, 64, 128]),
+            'latent_dim': tune.choice([1, 2, 4, 8]),
+            'n_epochs': tune.choice([200, 500, 1000]),
+            'lr': tune.loguniform(1e-4, 1e-2),
         }
-
-            # Print results
-        print('\n' + '='*50)
-        print('Optimize hyperparameters:')
-
+        
         scheduler = ASHAScheduler(
-            metric="mse",
-            mode="min",
-            max_t=args.n_epochs,
-        )
-        analysis = tune.run(
-            trainer.train_model,
-            config=search_space,
-            num_samples=10,
-            scheduler=scheduler,
-            metric = 'mse',
-            mode = 'min',
+            max_t=1000,
+            grace_period=100,
+            reduction_factor=2
         )
         
-        config = analysis.best_config
-        print("Best config:", config)
-        print("Best loss:", analysis.best_result["loss"])
-
+        analysis = tune.run(
+            tune.with_parameters(ray_trainable, train_graphs=train_graphs, val_graphs=val_graphs),
+            config=search_space,
+            num_samples=args.num_samples,
+            scheduler=scheduler,
+            metric="val_mse",
+            mode="min",
+            resources_per_trial={"cpu": 2},
+            verbose=1
+        )
+        
+        best_config = analysis.best_config
+        print("\nBest config:", best_config)
+        print("Best val MSE:", analysis.best_result["val_mse"])
+        
+        ray.shutdown()
     else:
-        config = {
-            'in_channels': data.shape[1],
+        best_config = {
+            'in_channels': in_channels,
             'hidden_channels': args.hidden_channels,
-            'batch_size': args.batch_size,
-            'latent_dimension': args.latent_dim,
+            'latent_dim': args.latent_dim,
             'n_epochs': args.n_epochs,
             'lr': args.lr,
-            'tuning': False
-        }            
+        }
     
-    #2) Train final model with optimal hyperparameters
-    final_model, latent_repr = trainer.train_full(
+    # Train final model on train+val with best config
+    print("\n" + "="*70)
+    print("Training final model with best hyperparameters")
+    print("="*70)
+    
+    trainer = TrainGAE(train_graphs, val_graphs, test_graphs, in_channels)
+    final_model = trainer.train_final(
+        config=best_config,
         save_results=args.save,
         output_dir=args.output_dir,
-        experiment_name=args.experiment_name,
-        config=config
-        )
+        experiment_name=args.experiment_name
+    )
     
-    return final_model, latent_repr, trainer
+    return final_model, trainer
 
 if __name__ == '__main__':
     main()
